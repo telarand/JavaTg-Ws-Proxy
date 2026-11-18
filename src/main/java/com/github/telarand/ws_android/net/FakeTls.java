@@ -1,12 +1,18 @@
 package com.github.telarand.ws_android.net;
 
-import android.util.Log;
-
 import java.io.*;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.security.SecureRandom;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -14,15 +20,22 @@ import java.util.concurrent.TimeUnit;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
+import com.github.telarand.ws_android.utils.Logger;
 import com.github.telarand.ws_android.stats.Stats;
 
 /**
- * Содержит:
- * - константы TLS
- * - verifyClientHello / buildServerHello
- * - wrapTlsRecord
- * - FakeTlsStream (обёртка над сокетом с буферизацией TLS-записей)
- * - proxyToMaskingDomain (прокси через маскирующий домен)
+ * Fake TLS (ee-secret) для входящих соединений.
+ *
+ * Обновлено до ядра основной ветки:
+ *  - ServerHello собирается динамически из ClientHello: выбор шифра
+ *    (TLS_AES_128_GCM_SHA256 -> AES_256 -> CHACHA20), зеркалирование
+ *    постквантовой группы X25519MLKEM768, если клиент её предложил;
+ *  - запись ApplicationData после CCS стала 64..160 байт (профилированный
+ *    размер не определялся на Android) вместо 1900..2100 — старый размер
+ *    выдаёт классический MTProxy и режется DPI;
+ *  - публичный ключ X25519 — валидный элемент поля (старший бит сброшен);
+ *  - replay-кэш ClientHello: повтор hello = активное зондирование -> маскировка;
+ *  - задержка отправки ServerHello 8..24 мс.
  */
 public final class FakeTls {
 
@@ -44,45 +57,182 @@ public final class FakeTls {
     public static final int TIMESTAMP_TOLERANCE = 120;
     public static final int TLS_APPDATA_MAX = 16384;
 
+    public static final int EXT_SUPPORTED_VERSIONS = 0x002b;
+    public static final int EXT_KEY_SHARE = 0x0033;
+
+    public static final int GROUP_X25519 = 0x001d;
+    public static final int GROUP_X25519MLKEM768 = 0x11ec;
+
+    public static final int X25519_KEY_LEN = 32;
+    public static final int X25519MLKEM768_CLIENT_SHARE_LEN = 1216;
+    public static final int MLKEM768_CIPHERTEXT_LEN = 1088;
+
+    /** TLS 1.3 наборы в порядке предпочтения типичного сервера. */
+    private static final int[] CIPHER_PREFERENCE = {0x1301, 0x1303, 0x1302};
+
+    /** Границы единственной AppData-записи после CCS (аналог FALLBACK_APPDATA_RANGE). */
+    public static final int FALLBACK_APPDATA_MIN = 64;
+    public static final int FALLBACK_APPDATA_MAX = 160;
+
+    /** Задержка перед отправкой ServerHello, мс (SERVER_HELLO_DELAY). */
+    public static final int SERVER_HELLO_DELAY_MIN_MS = 8;
+    public static final int SERVER_HELLO_DELAY_MAX_MS = 24;
+
+    /** Окно replay-кэша: 2*TOLERANCE+1 (REPLAY_WINDOW). */
+    public static final int REPLAY_WINDOW_SECONDS = 2 * TIMESTAMP_TOLERANCE + 1;
+    public static final int REPLAY_CACHE_SIZE = 65536;
+
     private static final byte[] _CCS_FRAME = {
             (byte) 0x14, 0x03, 0x03, 0x00, 0x01, 0x01
     };
 
-    private static final byte[] _SERVER_HELLO_TEMPLATE = new byte[]{
-            (byte) 0x16, 0x03, 0x03, 0x00, 0x7A,
-            (byte) 0x02, 0x00, 0x00, 0x76,
-            (byte) 0x03, 0x03,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            (byte) 0x20,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            (byte) 0x13, 0x01, 0x00,
-            0x00, 0x2E,
-            0x00, 0x33, 0x00, 0x24, 0x00, 0x1D, 0x00, 0x20,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x2B, 0x00, 0x02, 0x03, 0x04
-    };
-
     private static final int _SH_RANDOM_OFF = 11;
-    private static final int _SH_SESSID_OFF = 44;
-    private static final int _SH_PUBKEY_OFF = 89;
 
     private static final SecureRandom secureRandom = new SecureRandom();
 
     private FakeTls() {}
 
+    // ------------------------------------------------------------------
+    //  Replay-кэш (порт _ReplayCache)
+    // ------------------------------------------------------------------
+
+    private static final Object replayLock = new Object();
+    private static final LinkedHashMap<String, Long> replayExpiry = new LinkedHashMap<>();
+
     /**
-     * Создаёт HMAC-SHA256 от данных с заданным ключом.
+     * true, если такой client_random встречен впервые; false — это replay.
      */
+    public static boolean replayFirstSeen(byte[] clientRandom) {
+        long now = System.nanoTime() / 1_000_000_000L;
+        String key = bytesToHex(clientRandom);
+        synchronized (replayLock) {
+            Iterator<Map.Entry<String, Long>> it = replayExpiry.entrySet().iterator();
+            while (it.hasNext()) {
+                if (it.next().getValue() <= now) {
+                    it.remove();
+                } else {
+                    break; // вставка по порядку => протухшие в начале
+                }
+            }
+            if (replayExpiry.containsKey(key)) {
+                return false;
+            }
+            if (replayExpiry.size() >= REPLAY_CACHE_SIZE) {
+                Iterator<Map.Entry<String, Long>> first = replayExpiry.entrySet().iterator();
+                first.next();
+                first.remove();
+            }
+            replayExpiry.put(key, now + REPLAY_WINDOW_SECONDS);
+            return true;
+        }
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            sb.append(String.format("%02x", b));
+        }
+        return sb.toString();
+    }
+
+    // ------------------------------------------------------------------
+    //  Разбор ClientHello (порт parse_client_hello)
+    // ------------------------------------------------------------------
+
+    public static final class ClientHelloInfo {
+        public final Set<Integer> cipherSuites;
+        public final Map<Integer, Integer> keyShares; // named group -> длина key_exchange
+
+        ClientHelloInfo(Set<Integer> cipherSuites, Map<Integer, Integer> keyShares) {
+            this.cipherSuites = cipherSuites;
+            this.keyShares = keyShares;
+        }
+    }
+
+    private static final ClientHelloInfo EMPTY_HELLO_INFO =
+            new ClientHelloInfo(new HashSet<Integer>(), new HashMap<Integer, Integer>());
+
+    public static ClientHelloInfo parseClientHello(byte[] data) {
+        try {
+            int pos = 5 + 4 + 2 + CLIENT_RANDOM_LEN;
+            pos += 1 + (data[pos] & 0xFF); // session id
+
+            int suitesLen = ((data[pos] & 0xFF) << 8) | (data[pos + 1] & 0xFF);
+            pos += 2;
+            int suitesEnd = pos + suitesLen;
+            if (suitesEnd > data.length) {
+                return EMPTY_HELLO_INFO;
+            }
+            Set<Integer> suites = new HashSet<>();
+            for (int off = pos; off + 1 < suitesEnd; off += 2) {
+                suites.add(((data[off] & 0xFF) << 8) | (data[off + 1] & 0xFF));
+            }
+            pos = suitesEnd;
+
+            pos += 1 + (data[pos] & 0xFF); // compression methods
+
+            int extTotal = ((data[pos] & 0xFF) << 8) | (data[pos + 1] & 0xFF);
+            pos += 2;
+            int extEnd = Math.min(pos + extTotal, data.length);
+            Map<Integer, Integer> keyShares = new HashMap<>();
+            while (pos + 4 <= extEnd) {
+                int extType = ((data[pos] & 0xFF) << 8) | (data[pos + 1] & 0xFF);
+                int extLen = ((data[pos + 2] & 0xFF) << 8) | (data[pos + 3] & 0xFF);
+                pos += 4;
+                if (extType == EXT_KEY_SHARE && pos + 2 <= extEnd) {
+                    int sharesLen = ((data[pos] & 0xFF) << 8) | (data[pos + 1] & 0xFF);
+                    int sharesEnd = Math.min(pos + 2 + sharesLen, extEnd);
+                    int off = pos + 2;
+                    while (off + 4 <= sharesEnd) {
+                        int group = ((data[off] & 0xFF) << 8) | (data[off + 1] & 0xFF);
+                        int keyLen = ((data[off + 2] & 0xFF) << 8) | (data[off + 3] & 0xFF);
+                        off += 4 + keyLen;
+                        if (off <= sharesEnd && !keyShares.containsKey(group)) {
+                            keyShares.put(group, keyLen);
+                        }
+                    }
+                }
+                pos += extLen;
+            }
+            return new ClientHelloInfo(suites, keyShares);
+        } catch (Exception e) {
+            return EMPTY_HELLO_INFO;
+        }
+    }
+
+    private static int selectCipherSuite(ClientHelloInfo info) {
+        for (int suite : CIPHER_PREFERENCE) {
+            if (info.cipherSuites.contains(suite)) {
+                return suite;
+            }
+        }
+        return CIPHER_PREFERENCE[0];
+    }
+
+    /** Валидный публичный ключ X25519: элемент поля ниже 2^255. */
+    private static byte[] x25519PublicKey() {
+        byte[] key = new byte[X25519_KEY_LEN];
+        secureRandom.nextBytes(key);
+        key[X25519_KEY_LEN - 1] &= 0x7f;
+        return key;
+    }
+
+    /** Зеркалим гибридную постквантовую группу, если клиент её предложил. */
+    private static int serverKeyShareGroup(ClientHelloInfo info) {
+        Integer len = info.keyShares.get(GROUP_X25519MLKEM768);
+        return (len != null && len == X25519MLKEM768_CLIENT_SHARE_LEN)
+                ? GROUP_X25519MLKEM768 : GROUP_X25519;
+    }
+
+    private static int appdataLen() {
+        return FALLBACK_APPDATA_MIN
+                + secureRandom.nextInt(FALLBACK_APPDATA_MAX - FALLBACK_APPDATA_MIN + 1);
+    }
+
+    // ------------------------------------------------------------------
+    //  Проверка ClientHello
+    // ------------------------------------------------------------------
+
     private static byte[] hmacSha256(byte[] key, byte[] data) {
         try {
             Mac mac = Mac.getInstance("HmacSHA256");
@@ -94,9 +244,6 @@ public final class FakeTls {
         }
     }
 
-    /**
-     * Безопасное сравнение массивов (по времени).
-     */
     private static boolean constantTimeEquals(byte[] a, byte[] b) {
         if (a == null || b == null || a.length != b.length) return false;
         int result = 0;
@@ -106,10 +253,6 @@ public final class FakeTls {
         return result == 0;
     }
 
-
-    /**
-     * Результат проверки ClientHello.
-     */
     public static class TlsHelloInfo {
         public final byte[] clientRandom;
         public final byte[] sessionId;
@@ -122,9 +265,6 @@ public final class FakeTls {
         }
     }
 
-    /**
-     * Проверяет ClientHello и возвращает информацию или null.
-     */
     public static TlsHelloInfo verifyClientHello(byte[] data, byte[] secret) {
         int n = data.length;
         if (n < 43) return null;
@@ -169,36 +309,93 @@ public final class FakeTls {
         return new TlsHelloInfo(clientRandom, sessionId, timestamp);
     }
 
-    /**
-     * Строит ServerHello, CCS и фейковый ApplicationData.
-     */
-    public static byte[] buildServerHello(byte[] secret, byte[] clientRandom, byte[] sessionId) {
-        byte[] sh = _SERVER_HELLO_TEMPLATE.clone();
+    // ------------------------------------------------------------------
+    //  ServerHello
+    // ------------------------------------------------------------------
 
-        if (sessionId != null && sessionId.length == SESSION_ID_LEN) {
-            System.arraycopy(sessionId, 0, sh, _SH_SESSID_OFF, SESSION_ID_LEN);
+    private static void putBE16(byte[] buf, int off, int value) {
+        buf[off] = (byte) ((value >> 8) & 0xFF);
+        buf[off + 1] = (byte) (value & 0xFF);
+    }
+
+    /**
+     * ServerHello + CCS + одна AppData-запись.
+     * Клиенты Telegram разбирают ровно эти три записи и проверяют HMAC
+     * по всем, поэтому форма фиксирована, а размеры могут варьироваться.
+     */
+    public static byte[] buildServerHello(byte[] secret, byte[] clientRandom,
+                                          byte[] sessionId, ClientHelloInfo info) {
+        if (sessionId == null || sessionId.length != SESSION_ID_LEN) {
+            sessionId = new byte[SESSION_ID_LEN];
+        }
+        if (info == null) {
+            info = EMPTY_HELLO_INFO;
         }
 
-        byte[] pubkey = new byte[32];
-        secureRandom.nextBytes(pubkey);
-        System.arraycopy(pubkey, 0, sh, _SH_PUBKEY_OFF, 32);
+        int group = serverKeyShareGroup(info);
+        byte[] keyExchange = (group == GROUP_X25519MLKEM768)
+                ? new byte[MLKEM768_CIPHERTEXT_LEN + X25519_KEY_LEN]
+                : new byte[X25519_KEY_LEN];
+        secureRandom.nextBytes(keyExchange);
+        keyExchange[keyExchange.length - 1] &= 0x7f; // валидный X25519-элемент в хвосте
 
-        byte[] ccs = _CCS_FRAME;
+        byte[] extSupportedVersions = new byte[6];      // type(2)+len(2)+0304
+        putBE16(extSupportedVersions, 0, EXT_SUPPORTED_VERSIONS);
+        putBE16(extSupportedVersions, 2, 2);
+        extSupportedVersions[4] = TLS_VERSION_13[0];
+        extSupportedVersions[5] = TLS_VERSION_13[1];
 
-        int encryptedSize = 1900 + secureRandom.nextInt(201);
-        byte[] encryptedData = new byte[encryptedSize];
-        secureRandom.nextBytes(encryptedData);
-        ByteBuffer appRecord = ByteBuffer.allocate(5 + encryptedSize);
-        appRecord.put((byte) TLS_RECORD_APPDATA);
-        appRecord.put(TLS_VERSION_12);
-        appRecord.putShort((short) encryptedSize);
-        appRecord.put(encryptedData);
-        byte[] appRecordBytes = appRecord.array();
+        byte[] extKeyShare = new byte[8 + keyExchange.length]; // type(2)+len(2)+group(2)+klen(2)+kex
+        putBE16(extKeyShare, 0, EXT_KEY_SHARE);
+        putBE16(extKeyShare, 2, 4 + keyExchange.length);
+        putBE16(extKeyShare, 4, group);
+        putBE16(extKeyShare, 6, keyExchange.length);
+        System.arraycopy(keyExchange, 0, extKeyShare, 8, keyExchange.length);
 
-        ByteBuffer responseBuf = ByteBuffer.allocate(sh.length + ccs.length + appRecordBytes.length);
+        int extTotal = extSupportedVersions.length + extKeyShare.length;
+        int bodyLen = 2 + 32 + 1 + sessionId.length + 2 + 1 + 2 + extTotal;
+        int messageLen = 1 + 3 + bodyLen;
+        int shRecordLen = 5 + messageLen;
+
+        byte[] sh = new byte[shRecordLen];
+        sh[0] = (byte) TLS_RECORD_HANDSHAKE;
+        sh[1] = TLS_VERSION_12[0];
+        sh[2] = TLS_VERSION_12[1];
+        putBE16(sh, 3, messageLen);
+        int p = 5;
+        sh[p++] = 0x02; // handshake type = ServerHello
+        sh[p++] = (byte) ((bodyLen >> 16) & 0xFF);
+        sh[p++] = (byte) ((bodyLen >> 8) & 0xFF);
+        sh[p++] = (byte) (bodyLen & 0xFF);
+        sh[p++] = TLS_VERSION_12[0];
+        sh[p++] = TLS_VERSION_12[1];
+        p += 32; // server random (заполнится HMAC-ом ниже)
+        sh[p++] = (byte) sessionId.length;
+        System.arraycopy(sessionId, 0, sh, p, sessionId.length);
+        p += sessionId.length;
+        putBE16(sh, p, selectCipherSuite(info));
+        p += 2;
+        sh[p++] = 0x00; // compression
+        putBE16(sh, p, extTotal);
+        p += 2;
+        System.arraycopy(extSupportedVersions, 0, sh, p, extSupportedVersions.length);
+        p += extSupportedVersions.length;
+        System.arraycopy(extKeyShare, 0, sh, p, extKeyShare.length);
+
+        int appdataLen = appdataLen();
+        byte[] appRecord = new byte[5 + appdataLen];
+        appRecord[0] = (byte) TLS_RECORD_APPDATA;
+        appRecord[1] = TLS_VERSION_12[0];
+        appRecord[2] = TLS_VERSION_12[1];
+        putBE16(appRecord, 3, appdataLen);
+        byte[] appData = new byte[appdataLen];
+        secureRandom.nextBytes(appData);
+        System.arraycopy(appData, 0, appRecord, 5, appdataLen);
+
+        ByteBuffer responseBuf = ByteBuffer.allocate(sh.length + _CCS_FRAME.length + appRecord.length);
         responseBuf.put(sh);
-        responseBuf.put(ccs);
-        responseBuf.put(appRecordBytes);
+        responseBuf.put(_CCS_FRAME);
+        responseBuf.put(appRecord);
         byte[] response = responseBuf.array();
 
         ByteBuffer hmacInput = ByteBuffer.allocate(clientRandom.length + response.length);
@@ -206,18 +403,25 @@ public final class FakeTls {
         hmacInput.put(response);
         byte[] serverRandom = hmacSha256(secret, hmacInput.array());
 
-        System.arraycopy(serverRandom, 0, sh, _SH_RANDOM_OFF, 32);
+        System.arraycopy(serverRandom, 0, response, _SH_RANDOM_OFF, 32);
 
-        ByteBuffer finalBuf = ByteBuffer.allocate(sh.length + ccs.length + appRecordBytes.length);
-        finalBuf.put(sh);
-        finalBuf.put(ccs);
-        finalBuf.put(appRecordBytes);
-        return finalBuf.array();
+        return response;
     }
 
-    /**
-     * Упаковывает данные в TLS Application Data записи (по 16KB).
-     */
+    /** Задержка SERVER_HELLO_DELAY (8..24 мс). */
+    public static void applyServerHelloDelay() {
+        try {
+            Thread.sleep(SERVER_HELLO_DELAY_MIN_MS
+                    + secureRandom.nextInt(SERVER_HELLO_DELAY_MAX_MS - SERVER_HELLO_DELAY_MIN_MS + 1));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    //  TLS-обёртка исходящих данных
+    // ------------------------------------------------------------------
+
     public static byte[] wrapTlsRecord(byte[] data) {
         if (data == null || data.length == 0) return new byte[0];
         ByteBuffer out = ByteBuffer.allocate(data.length + (5 * ((data.length + TLS_APPDATA_MAX - 1) / TLS_APPDATA_MAX)));
@@ -236,10 +440,6 @@ public final class FakeTls {
         return result;
     }
 
-    /**
-     * Обёртка над сокетом для чтения/записи TLS-записей.
-     * Буферизирует Application Data и обрабатывает CCS.
-     */
     public static class FakeTlsStream extends InputStream{
         private final Socket socket;
         private final InputStream input;
@@ -253,9 +453,6 @@ public final class FakeTls {
             this.output = socket.getOutputStream();
         }
 
-        /**
-         * Читает ровно n байт из потока (с учётом буфера).
-         */
         public byte[] readexactly(int n) throws IOException {
             while (readBuffer.size() < n) {
                 byte[] payload = readTlsPayload();
@@ -273,9 +470,6 @@ public final class FakeTls {
             return result;
         }
 
-        /**
-         * Читает до n байт (не блокирует, если в буфере есть данные).
-         */
         public byte[] readBytes(int n) throws IOException {
             if (readBuffer.size() > 0) {
                 int avail = Math.min(n, readBuffer.size());
@@ -300,10 +494,6 @@ public final class FakeTls {
             return payload;
         }
 
-        /**
-         * Читает один TLS-запись и возвращает Application Data.
-         * Пропускает CCS.
-         */
         private byte[] readTlsPayload() throws IOException {
             if (readLeft > 0) {
                 byte[] data = new byte[readLeft];
@@ -365,34 +555,22 @@ public final class FakeTls {
             }
         }
 
-        /**
-         * Записывает данные, обёрнутые в TLS Application Data записи.
-         */
         public void write(byte[] data) throws IOException {
             output.write(wrapTlsRecord(data));
         }
 
-        /**
-         * Сбрасывает буфер вывода.
-         */
         public void drain() throws IOException {
             output.flush();
         }
 
-        /**
-         * Закрывает сокет.
-         */
         public void close() throws IOException {
             socket.close();
         }
 
-        /**
-         * Проверяет, закрыт ли сокет.
-         */
         public boolean isClosed() {
             return socket.isClosed();
         }
-        
+
         @Override
         public int read() throws IOException {
             byte[] b = new byte[1];
@@ -411,19 +589,16 @@ public final class FakeTls {
         }
     }
 
-
-    /**
-     * Проксирует соединение через маскирующий домен (443).
-     * Использует два потока для двунаправленного релея.
-     */
     public static void proxyToMaskingDomain(Socket clientSocket,
                                             byte[] initialData,
                                             String domain,
                                             String label) throws IOException {
         Stats.INSTANCE.incConnectionsMasked();
-        Log.d(TAG, "[" + label + "] masking -> " + domain + ":443");
+        Logger.d(TAG, "[" + label + "] masking -> " + domain + ":443");
 
-        try (Socket upstream = new Socket(domain, 443)) {
+        Socket upstream = new Socket();
+        try {
+            upstream.connect(new InetSocketAddress(domain, 443), 10000);
             upstream.setSoTimeout(30000);
 
             OutputStream upstreamOut = upstream.getOutputStream();
@@ -468,11 +643,13 @@ public final class FakeTls {
                     executor.shutdownNow();
                 }
             });
-			
+
             executor.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS);
 
         } catch (Exception e) {
-            Log.w(TAG, "[" + label + "] masking error: " + e.getMessage());
+            Logger.w(TAG, "[" + label + "] masking error: " + e.getMessage());
+        } finally {
+            try { upstream.close(); } catch (Exception ignored) {}
         }
     }
 }

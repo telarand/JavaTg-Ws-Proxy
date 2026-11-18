@@ -1,12 +1,12 @@
 package com.github.telarand.ws_android.pool;
 
-import android.util.Log;
-
+import com.github.telarand.ws_android.utils.Logger;
 import com.github.telarand.ws_android.config.ConfigManager;
 import com.github.telarand.ws_android.config.ProxyConfig;
 import com.github.telarand.ws_android.net.RawWebSocket;
 import com.github.telarand.ws_android.stats.Stats;
 import com.github.telarand.ws_android.utils.MTProtoUtils;
+import com.github.telarand.ws_android.pool.PoolTimingConfig;
 
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
@@ -21,7 +21,6 @@ import java.util.concurrent.*;
 public final class CfWorkerPool {
 
     private static final String TAG = "CfWorkerPool";
-    private static final double WS_POOL_MAX_AGE = 120.0;
 
     private final Map<CfKey, Deque<WsEntry>> idle = new ConcurrentHashMap<>();
     private final Set<CfKey> refilling = ConcurrentHashMap.newKeySet();
@@ -63,18 +62,19 @@ public final class CfWorkerPool {
         Deque<WsEntry> bucket = idle.computeIfAbsent(key, k -> new ConcurrentLinkedDeque<>());
 
         double now = System.nanoTime() / 1_000_000_000.0;
+        double maxAge = PoolTimingConfig.getCfPoolMaxAge();
 
         while (!bucket.isEmpty()) {
             WsEntry entry = bucket.poll();
             RawWebSocket ws = entry.ws;
             double age = now - entry.created;
             boolean isClosed = ws.isClosed();
-            if (age > WS_POOL_MAX_AGE || isClosed) {
+            if (age > maxAge || isClosed) {
                 quietClose(ws);
                 continue;
             }
             Stats.INSTANCE.incCfPoolHits();
-            Log.d(TAG, String.format("CF worker pool hit DC%d (age=%.1fs, left=%d)",
+            Logger.d(TAG, String.format("CF worker pool hit DC%d (age=%.1fs, left=%d)",
                     dc, age, bucket.size()));
             scheduleRefill(key, fallbackDst);
             return ws;
@@ -91,7 +91,7 @@ public final class CfWorkerPool {
                 try {
                     refill(key, fallbackDst);
                 } catch (Exception e) {
-                    Log.w(TAG, "Refill failed for " + key.dc + "/" + key.workerDomain, e);
+                    Logger.w(TAG, "Refill failed for " + key.dc + "/" + key.workerDomain, e);
                 } finally {
                     refilling.remove(key);
                 }
@@ -120,7 +120,7 @@ public final class CfWorkerPool {
             } catch (Exception ignored) {}
         }
 
-        Log.d(TAG, String.format("CF worker pool refilled DC%d: %d ready", key.dc, bucket.size()));
+        Logger.d(TAG, String.format("CF worker pool refilled DC%d: %d ready", key.dc, bucket.size()));
     }
 
     private RawWebSocket connectOne(String workerDomain, String fallbackDst, int dc) {
@@ -159,7 +159,7 @@ public final class CfWorkerPool {
         }
 
         if (fallbacks.isEmpty() || config.getCfproxyWorkerDomains().isEmpty()) {
-            Log.i(TAG, "CF worker pool warmup skipped (no fallback DCs or no worker domains)");
+            Logger.i(TAG, "CF worker pool warmup skipped (no fallback DCs or no worker domains)");
             return;
         }
 
@@ -172,7 +172,7 @@ public final class CfWorkerPool {
             }
         }
 
-        Log.i(TAG, "CF worker pool warmup started for " + fallbacks.size() + " DC(s)");
+        Logger.i(TAG, "CF worker pool warmup started for " + fallbacks.size() + " DC(s)");
     }
 
     public void reset() {

@@ -19,6 +19,30 @@ public class ProxyConfig {
     private String fakeTlsDomain = "";
     private boolean proxyProtocol = false;
 
+    private boolean forceCfProxy = false;
+    private boolean disableSecure = false;
+    private boolean forceTestDc = false;
+    private boolean cfproxyH2Media = true;
+
+    public boolean isForceCfProxy() { return forceCfProxy; }
+    public void setForceCfProxy(boolean force) { this.forceCfProxy = force; }
+
+    /** true - CF-proxy/CF-worker ходят по порту 80 без TLS. */
+    public boolean isDisableSecure() { return disableSecure; }
+    public void setDisableSecure(boolean v) { this.disableSecure = v; }
+
+    /** true - весь трафик принудительно на тестовые DC. */
+    public boolean isForceTestDc() { return forceTestDc; }
+    public void setForceTestDc(boolean v) { this.forceTestDc = v; }
+
+    /** HTTP/2-транспорт для media через Cloudflare. */
+    public boolean isCfproxyH2Media() { return cfproxyH2Media; }
+    public void setCfproxyH2Media(boolean v) { this.cfproxyH2Media = v; }
+
+    public boolean isH2Enabled() {
+        return cfproxyH2Media && fallbackCfproxy && !disableSecure && !forceTestDc;
+    }
+
     public ProxyConfig() {
         byte[] random = new byte[16];
         new Random().nextBytes(random);

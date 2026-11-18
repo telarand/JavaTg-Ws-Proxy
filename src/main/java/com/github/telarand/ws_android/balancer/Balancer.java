@@ -4,7 +4,6 @@ import java.util.*;
 
 /**
  * Балансировщик, управляющий списком доменов и маппингом DC → домен.
- * Полностью соответствует Python-классу _Balancer.
  */
 public final class Balancer {
 
@@ -16,9 +15,6 @@ public final class Balancer {
     private final List<String> domains = new ArrayList<>();
     private final Map<Integer, String> dcToDomain = new HashMap<>();
 
-    /**
-     * Сравнивает два списка как мультимножества (по частоте элементов).
-     */
     private static <T> boolean areMultisetsEqual(List<T> list1, List<T> list2) {
         if (list1.size() != list2.size()) return false;
         Map<T, Integer> freq1 = new HashMap<>();
@@ -28,10 +24,6 @@ public final class Balancer {
         return freq1.equals(freq2);
     }
 
-    /**
-     * Обновляет список доменов, если он изменился (по мультимножеству).
-     * Также пересоздаёт случайный маппинг для всех DC.
-     */
     public synchronized void updateDomainsList(List<String> domainsList) {
         if (areMultisetsEqual(this.domains, domainsList)) {
             return;
@@ -65,11 +57,6 @@ public final class Balancer {
         return true;
     }
 
-    /**
-     * Возвращает итератор по доменам для указанного DC:
-     * сначала закреплённый домен (если есть), затем все остальные домены
-     * из общего списка в случайном порядке (кроме закреплённого).
-     */
     public synchronized Iterator<String> getDomainsForDc(int dcId) {
         String currentDomain = this.dcToDomain.get(dcId);
 

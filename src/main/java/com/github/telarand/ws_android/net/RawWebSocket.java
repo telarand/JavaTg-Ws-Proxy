@@ -1,6 +1,7 @@
 package com.github.telarand.ws_android.net;
 
 import java.io.*;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
@@ -10,7 +11,10 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 
+import javax.net.ssl.SNIHostName;
+import javax.net.ssl.SNIServerName;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.TrustManager;
@@ -22,6 +26,13 @@ import com.github.telarand.ws_android.config.ProxyConfig;
 /**
  * Низкоуровневый WebSocket-клиент.
  * Поддерживает только бинарные фреймы (opcode 0x2), PING, PONG, CLOSE.
+ *
+ * Обновлено до ядра основной ветки:
+ *  - ALPN "http/1.1" для WS-соединений (ClientHello без ALPN режется DPI);
+ *  - ALPN "h2" для H2-транспорта (используется CfH2Pool);
+ *  - явный таймаут TCP-подключения;
+ *  - режим secure=false (порт 80, без TLS);
+ *  - раздельные host / SNI для domain fronting.
  */
 public final class RawWebSocket implements Closeable {
 
@@ -29,6 +40,9 @@ public final class RawWebSocket implements Closeable {
     public static final int OP_CLOSE  = 0x8;
     public static final int OP_PING   = 0x9;
     public static final int OP_PONG   = 0xA;
+
+    public static final String ALPN_HTTP_1_1 = "http/1.1";
+    public static final String ALPN_H2       = "h2";
 
     private final Socket socket;
     private final InputStream input;
@@ -62,100 +76,132 @@ public final class RawWebSocket implements Closeable {
     }
 
     /**
-     * Устанавливает WebSocket-соединение с заданным хостом и доменом.
-     * @param host      IP-адрес или имя хоста (для соединения)
-     * @param domain    домен для TLS SNI и Host-заголовка
-     * @param timeout   таймаут в секундах
-     * @param path      путь WebSocket (по умолчанию "/apiws")
-     * @return          объект RawWebSocket
-     * @throws IOException при ошибках ввода-вывода
-     * @throws WsHandshakeException при неудачном handshake (статус != 101)
+     * Устанавливает WebSocket-соединение (TLS, порт 443).
+     * Совместимо со старым вызовом: host == IP или домен, domain — для SNI и Host.
      */
     public static RawWebSocket connect(String host, String domain, float timeout, String path)
+            throws IOException, WsHandshakeException {
+        return connect(host, domain, timeout, path, null, true);
+    }
+
+    /**
+     * Полная версия подключения.
+     * @param host      IP-адрес или имя хоста (куда реально идёт TCP)
+     * @param domain    домен для Host-заголовка
+     * @param timeout   таймаут в секундах
+     * @param path      путь WebSocket (по умолчанию "/apiws")
+     * @param sni       переопределение SNI (domain fronting); null — использовать domain
+     * @param secure    true — TLS:443, false — plaintext:80 (disable_secure)
+     */
+    public static RawWebSocket connect(String host, String domain, float timeout, String path,
+                                       String sni, boolean secure)
             throws IOException, WsHandshakeException {
         if (path == null || path.isEmpty()) {
             path = "/apiws";
         }
         int timeoutMs = (int) (timeout * 1000);
-        if (timeoutMs <= 0) timeoutMs = 10000;
+        if (timeoutMs <= 0) timeoutMs = 30000;
 
-        SSLSocket sslSocket = (SSLSocket) sslSocketFactory.createSocket(host, 443);
-        sslSocket.setSoTimeout(timeoutMs);
-        if (domain != null && !domain.isEmpty()) {
-            sslSocket.getSSLParameters().setServerNames(
-                    java.util.Collections.singletonList(
-                            new javax.net.ssl.SNIHostName(domain)
-                    )
-            );
-        }
-        sslSocket.startHandshake();
-        setSockOpts(sslSocket);
+        Socket socket;
+        if (secure) {
+            SSLSocket sslSocket = (SSLSocket) sslSocketFactory.createSocket();
+            // Явный таймаут TCP-подключения (createSocket(host, port) вешается навсегда)
+            sslSocket.connect(new InetSocketAddress(host, 443), Math.max(timeoutMs, 10000));
+            sslSocket.setSoTimeout(timeoutMs);
+            sslSocket.setKeepAlive(true);
 
-        byte[] wsKeyBytes = new byte[16];
-        RANDOM.nextBytes(wsKeyBytes);
-        String wsKey = Base64.getEncoder().encodeToString(wsKeyBytes);
-
-        String request = "GET " + path + " HTTP/1.1\r\n" +
-                "Host: " + domain + "\r\n" +
-                "Upgrade: websocket\r\n" +
-                "Connection: Upgrade\r\n" +
-                "Sec-WebSocket-Key: " + wsKey + "\r\n" +
-                "Sec-WebSocket-Version: 13\r\n" +
-                "Sec-WebSocket-Protocol: binary\r\n" +
-                "\r\n";
-
-        OutputStream out = sslSocket.getOutputStream();
-        out.write(request.getBytes("UTF-8"));
-        out.flush();
-
-        BufferedReader reader = new BufferedReader(new InputStreamReader(sslSocket.getInputStream(), "UTF-8"));
-        List<String> responseLines = new ArrayList<>();
-        try {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (line.isEmpty()) break;
-                responseLines.add(line.trim());
+            SSLParameters params = sslSocket.getSSLParameters();
+            String sniHost = (sni != null && !sni.isEmpty()) ? sni : domain;
+            if (sniHost != null && !sniHost.isEmpty()) {
+                params.setServerNames(java.util.Collections.singletonList(
+                        new SNIHostName(sniHost)
+                ));
             }
-        } catch (SocketTimeoutException e) {
-            sslSocket.close();
-            throw new IOException("Timeout reading handshake response", e);
+            // ClientHello без ALPN — аномалия, которую режет DPI.
+            // Для WS обязательно HTTP/1.1 (Upgrade не работает поверх h2).
+            params.setApplicationProtocols(new String[]{ALPN_HTTP_1_1});
+            sslSocket.setSSLParameters(params);
+            sslSocket.startHandshake();
+            socket = sslSocket;
+        } else {
+            Socket plain = new Socket();
+            plain.connect(new InetSocketAddress(host, 80), Math.max(timeoutMs, 10000));
+            plain.setSoTimeout(timeoutMs);
+            plain.setKeepAlive(true);
+            socket = plain;
         }
 
-        if (responseLines.isEmpty()) {
-            sslSocket.close();
-            throw new WsHandshakeException(0, "empty response");
-        }
-
-        String firstLine = responseLines.get(0);
-        String[] parts = firstLine.split(" ", 3);
-        int statusCode;
         try {
-            statusCode = (parts.length >= 2) ? Integer.parseInt(parts[1]) : 0;
-        } catch (NumberFormatException e) {
-            statusCode = 0;
-        }
+            setSockOpts(socket);
 
-        if (statusCode == 101) {
-            return new RawWebSocket(sslSocket);
-        }
+            byte[] wsKeyBytes = new byte[16];
+            RANDOM.nextBytes(wsKeyBytes);
+            String wsKey = Base64.getEncoder().encodeToString(wsKeyBytes);
 
-        java.util.Map<String, String> headers = new java.util.HashMap<>();
-        for (int i = 1; i < responseLines.size(); i++) {
-            String line = responseLines.get(i);
-            int idx = line.indexOf(':');
-            if (idx > 0) {
-                String key = line.substring(0, idx).trim().toLowerCase();
-                String value = line.substring(idx + 1).trim();
-                headers.put(key, value);
+            String request = "GET " + path + " HTTP/1.1\r\n" +
+                    "Host: " + domain + "\r\n" +
+                    "Upgrade: websocket\r\n" +
+                    "Connection: Upgrade\r\n" +
+                    "Sec-WebSocket-Key: " + wsKey + "\r\n" +
+                    "Sec-WebSocket-Version: 13\r\n" +
+                    "Sec-WebSocket-Protocol: binary\r\n" +
+                    "\r\n";
+
+            OutputStream out = socket.getOutputStream();
+            out.write(request.getBytes("UTF-8"));
+            out.flush();
+
+            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
+            List<String> responseLines = new ArrayList<>();
+            try {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.isEmpty()) break;
+                    responseLines.add(line.trim());
+                }
+            } catch (SocketTimeoutException e) {
+                socket.close();
+                throw new IOException("Timeout reading handshake response", e);
             }
-        }
-        String location = headers.get("location");
-        sslSocket.close();
-        throw new WsHandshakeException(statusCode, firstLine, headers, location);
-    }
 
-    public static RawWebSocket connect(String host, String domain) throws IOException, WsHandshakeException {
-        return connect(host, domain, 10.0f, "/apiws");
+            if (responseLines.isEmpty()) {
+                socket.close();
+                throw new WsHandshakeException(0, "empty response");
+            }
+
+            String firstLine = responseLines.get(0);
+            String[] parts = firstLine.split(" ", 3);
+            int statusCode;
+            try {
+                statusCode = (parts.length >= 2) ? Integer.parseInt(parts[1]) : 0;
+            } catch (NumberFormatException e) {
+                statusCode = 0;
+            }
+
+            if (statusCode == 101) {
+                return new RawWebSocket(socket);
+            }
+
+            java.util.Map<String, String> headers = new java.util.HashMap<>();
+            for (int i = 1; i < responseLines.size(); i++) {
+                String line = responseLines.get(i);
+                int idx = line.indexOf(':');
+                if (idx > 0) {
+                    String key = line.substring(0, idx).trim().toLowerCase();
+                    String value = line.substring(idx + 1).trim();
+                    headers.put(key, value);
+                }
+            }
+            String location = headers.get("location");
+            socket.close();
+            throw new WsHandshakeException(statusCode, firstLine, headers, location);
+        } catch (IOException e) {
+            try { socket.close(); } catch (Exception ignored) {}
+            throw e;
+        } catch (RuntimeException e) {
+            try { socket.close(); } catch (Exception ignored) {}
+            throw e;
+        }
     }
 
     private static void setSockOpts(Socket sock) {
@@ -170,9 +216,6 @@ public final class RawWebSocket implements Closeable {
         } catch (Exception ignored) {}
     }
 
-    /**
-     * Отправляет бинарный фрейм (маскированный).
-     */
     public synchronized void send(byte[] data) throws IOException {
         if (closed) throw new IOException("WebSocket already closed");
         byte[] frame = buildFrame(OP_BINARY, data, true);
@@ -180,9 +223,6 @@ public final class RawWebSocket implements Closeable {
         output.flush();
     }
 
-    /**
-     * Отправляет несколько бинарных фреймов в одном пакете (оптимизация).
-     */
     public synchronized void sendBatch(List<byte[]> parts) throws IOException {
         if (closed) throw new IOException("WebSocket already closed");
         for (byte[] part : parts) {
@@ -191,11 +231,6 @@ public final class RawWebSocket implements Closeable {
         output.flush();
     }
 
-    /**
-     * Читает следующий фрейм и возвращает его payload.
-     * Обрабатывает PING (отвечает PONG), PONG (пропускает), CLOSE (закрывает и возвращает null).
-     * @return байты payload для бинарных фреймов, null при закрытии.
-     */
     public byte[] recv() throws IOException {
         while (!closed) {
             Frame frame = readFrame();
@@ -232,9 +267,6 @@ public final class RawWebSocket implements Closeable {
         return null;
     }
 
-    /**
-     * Закрывает соединение (отправляет CLOSE и закрывает сокет).
-     */
     @Override
     public synchronized void close() {
         if (closed) return;
@@ -258,9 +290,6 @@ public final class RawWebSocket implements Closeable {
         }
     }
 
-    /**
-     * Строит WebSocket-фрейм (с маской или без).
-     */
     private static byte[] buildFrame(int opcode, byte[] data, boolean mask) {
         int length = (data != null) ? data.length : 0;
         ByteBuffer buf;
@@ -277,7 +306,7 @@ public final class RawWebSocket implements Closeable {
 
         buf = ByteBuffer.allocate(headerLen + length);
         buf.order(ByteOrder.BIG_ENDIAN);
-		
+
         buf.put((byte) (0x80 | (opcode & 0x0F)));
 
         int maskBit = mask ? 0x80 : 0x00;
@@ -311,9 +340,6 @@ public final class RawWebSocket implements Closeable {
         return result;
     }
 
-    /**
-     * Читает один фрейм из входного потока.
-     */
     private Frame readFrame() throws IOException {
         byte[] header = new byte[2];
         readExact(header, 0, 2);
@@ -358,9 +384,6 @@ public final class RawWebSocket implements Closeable {
         return new Frame(opcode, payload);
     }
 
-    /**
-     * Читает ровно len байт в массив.
-     */
     private void readExact(byte[] buffer, int offset, int len) throws IOException {
         int totalRead = 0;
         while (totalRead < len) {
@@ -372,9 +395,6 @@ public final class RawWebSocket implements Closeable {
         }
     }
 
-    /**
-     * XOR маска над данными.
-     */
     private static byte[] xorMask(byte[] data, byte[] mask) {
         if (data == null || data.length == 0) return data;
         byte[] result = new byte[data.length];
@@ -414,10 +434,7 @@ public final class RawWebSocket implements Closeable {
                    statusCode == 303 || statusCode == 307 || statusCode == 308;
         }
     }
-    /**
-     * Проверяет, закрыт ли сокет физически.
-     * @return true, если сокет закрыт или null
-     */
+
     public boolean isClosed() {
         return socket == null || socket.isClosed();
     }

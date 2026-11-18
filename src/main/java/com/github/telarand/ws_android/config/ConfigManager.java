@@ -1,15 +1,12 @@
 package com.github.telarand.ws_android.config;
 
-import android.util.Log;
-
+import com.github.telarand.ws_android.utils.Logger;
 import com.github.telarand.ws_android.utils.MTProtoUtils;
 import com.github.telarand.ws_android.balancer.Balancer;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
 import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -32,7 +29,8 @@ public final class ConfigManager {
     private static final List<String> CFPROXY_ENC = Arrays.asList(
             "virkgj.com", "vmmzovy.com", "mkuosckvso.com", "zaewayzmplad.com", "twdmbzcm.com",
             "awzwsldi.com", "clngqrflngqin.com", "tjacxbqtj.com", "bxaxtxmrw.com", "dmohrsgmohcrwb.com",
-            "vwbmtmoi.com", "khgrre.com", "ulihssf.com", "tmhqsdqmfpmk.com", "xwuwoqbm.com"
+            "vwbmtmoi.com", "khgrre.com", "ulihssf.com", "tmhqsdqmfpmk.com", "xwuwoqbm.com",
+            "orgcnunpj.com", "zhkuldz.com", "zypoljnslxa.com", "efabnxaowuzs.com", "zaftuzsftqdq.com"
     );
 
     private static final String DECODED_SUFFIX = ".co.uk";
@@ -48,9 +46,6 @@ public final class ConfigManager {
         return PROXY_CONFIG;
     }
 
-    /**
-     * Декодирует зашифрованный домен CF-прокси.
-     */
     private static String decodeCfproxyDomain(String s) {
         if (!s.endsWith(".com")) {
             return s;
@@ -75,43 +70,7 @@ public final class ConfigManager {
         return decoded.toString();
     }
 
-    /**
-     * Преобразует строку или список строк в список уникальных доменов.
-     */
-    public static List<String> coerceDomainList(Object value) {
-        List<String> items = new ArrayList<>();
-        if (value instanceof String) {
-            String str = (String) value;
-            String[] parts = str.replace(',', ' ').replace(';', ' ').split("\\s+");
-            for (String p : parts) {
-                if (!p.isEmpty()) items.add(p);
-            }
-        } else if (value instanceof List) {
-            for (Object obj : (List<?>) value) {
-                if (obj instanceof String) {
-                    String str = (String) obj;
-                    String[] parts = str.replace(',', ' ').replace(';', ' ').split("\\s+");
-                    for (String p : parts) {
-                        if (!p.isEmpty()) items.add(p);
-                    }
-                }
-            }
-        }
-        Set<String> seen = new HashSet<>();
-        List<String> result = new ArrayList<>();
-        for (String item : items) {
-            String key = item.toLowerCase();
-            if (!seen.contains(key)) {
-                seen.add(key);
-                result.add(item);
-            }
-        }
-        return result;
-    }
 
-    /**
-     * Проверяет, является ли строка валидным доменным именем.
-     */
     private static boolean isValidDomain(String domain) {
         if (domain == null || domain.isEmpty() || domain.length() > 253) return false;
         if (domain.startsWith(".") || domain.endsWith(".")) return false;
@@ -131,9 +90,6 @@ public final class ConfigManager {
         return hasLetter;
     }
 
-    /**
-     * Нормализует список доменов: удаляет дубли, невалидные, приводит к нижнему регистру.
-     */
     private static List<String> normalizeDomainPool(List<String> domains) {
         Set<String> seen = new HashSet<>();
         List<String> result = new ArrayList<>();
@@ -148,9 +104,6 @@ public final class ConfigManager {
         return result;
     }
 
-    /**
-     * Загружает список доменов CF-прокси с GitHub.
-     */
     private static List<String> fetchCfproxyDomainList() {
         OkHttpClient client = MTProtoUtils.buildGithubClient();
         String randomParam = "?r=" + System.currentTimeMillis();
@@ -161,7 +114,7 @@ public final class ConfigManager {
 
         try (Response response = client.newCall(request).execute()) {
             if (!response.isSuccessful()) {
-                Log.w(TAG, "Failed to fetch CF proxy domains, HTTP " + response.code());
+                Logger.w(TAG, "Failed to fetch CF proxy domains, HTTP " + response.code());
                 return Collections.emptyList();
             }
             BufferedReader reader = new BufferedReader(new InputStreamReader(response.body().byteStream()));
@@ -178,14 +131,11 @@ public final class ConfigManager {
             }
             return decoded;
         } catch (IOException e) {
-            Log.w(TAG, "IOException fetching CF proxy domains: " + e.getMessage());
+            Logger.w(TAG, "IOException fetching CF proxy domains: " + e.getMessage());
             return Collections.emptyList();
         }
     }
 
-    /**
-     * Обновляет список доменов в балансировщике.
-     */
     public static synchronized void refreshCfproxyDomains() {
         ProxyConfig config = getProxyConfig();
         if (!config.getCfproxyUserDomains().isEmpty()) {
@@ -197,22 +147,19 @@ public final class ConfigManager {
 
         if (pool.size() >= CFPROXY_MIN_VALID_DOMAINS) {
             Balancer.INSTANCE.updateDomainsList(pool);
-            Log.i(TAG, "CF proxy domain pool updated from GitHub (" + pool.size() + " domains)");
+            Logger.i(TAG, "CF proxy domain pool updated from GitHub (" + pool.size() + " domains)");
             return;
         }
 
         if (!fetched.isEmpty()) {
-            Log.w(TAG, "Ignoring fetched CF proxy domains due to low-quality payload " +
+            Logger.w(TAG, "Ignoring fetched CF proxy domains due to low-quality payload " +
                     "(total=" + fetched.size() + ", valid=" + pool.size() +
                     ", required>=" + CFPROXY_MIN_VALID_DOMAINS + "); keeping current domain pool");
         } else {
-            Log.w(TAG, "CF proxy domain refresh failed or empty response; keeping current domain pool");
+            Logger.w(TAG, "CF proxy domain refresh failed or empty response; keeping current domain pool");
         }
     }
 
-    /**
-     * Запускает фоновое обновление доменов (раз в час).
-     */
     public static synchronized void startCfproxyDomainRefresh() {
         if (refreshRunning) {
             stopCfproxyDomainRefresh();
@@ -233,12 +180,9 @@ public final class ConfigManager {
         });
         scheduler.scheduleAtFixedRate(ConfigManager::refreshCfproxyDomains, 1, 1, TimeUnit.HOURS);
         refreshRunning = true;
-        Log.i(TAG, "CF proxy domain refresh started (hourly)");
+        Logger.i(TAG, "CF proxy domain refresh started (hourly)");
     }
 
-    /**
-     * Останавливает фоновое обновление.
-     */
     public static synchronized void stopCfproxyDomainRefresh() {
         if (scheduler != null) {
             scheduler.shutdownNow();
@@ -248,12 +192,38 @@ public final class ConfigManager {
             } catch (InterruptedException ignored) {}
             scheduler = null;
             refreshRunning = false;
-            Log.i(TAG, "CF proxy domain refresh stopped");
+            Logger.i(TAG, "CF proxy domain refresh stopped");
         }
     }
 
     /**
-     * Парсит список строк вида "DC:IP" в Map<Integer, String>.
+     * Преобразует строку или список строк в список уникальных доменов
+     */
+    public static List<String> coerceDomainList(List<String> values) {
+        List<String> items = new ArrayList<>();
+        if (values != null) {
+            for (String entry : values) {
+                if (entry == null) continue;
+                String[] parts = entry.replace(',', ' ').replace(';', ' ').split("\\s+");
+                for (String p : parts) {
+                    if (!p.isEmpty()) items.add(p);
+                }
+            }
+        }
+        Set<String> seen = new HashSet<>();
+        List<String> result = new ArrayList<>();
+        for (String item : items) {
+            String key = item.toLowerCase();
+            if (!seen.contains(key)) {
+                seen.add(key);
+                result.add(item);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Парсит список строк вида "DC:IP" в Map<Integer, String>
      */
     public static Map<Integer, String> parseDcIpList(List<String> dcIpList) {
         Map<Integer, String> redirects = new HashMap<>();
@@ -267,15 +237,19 @@ public final class ConfigManager {
             }
             int dc;
             try {
-                dc = Integer.parseInt(parts[0]);
+                dc = Integer.parseInt(parts[0].trim());
             } catch (NumberFormatException e) {
                 throw new IllegalArgumentException("Invalid DC number: " + parts[0]);
             }
-            String ip = parts[1];
-            try {
-                InetAddress.getByName(ip);
-            } catch (UnknownHostException e) {
+            String ip = parts[1].trim();
+            if (!ip.matches("(\\d{1,3}\\.){3}\\d{1,3}")) {
                 throw new IllegalArgumentException("Invalid IP address: " + ip);
+            }
+            String[] octets = ip.split("\\.");
+            for (String octet : octets) {
+                if (Integer.parseInt(octet) > 255) {
+                    throw new IllegalArgumentException("Invalid IP address: " + ip);
+                }
             }
             redirects.put(dc, ip);
         }

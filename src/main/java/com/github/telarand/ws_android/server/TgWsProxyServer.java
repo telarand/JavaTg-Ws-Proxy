@@ -1,7 +1,6 @@
 package com.github.telarand.ws_android.server;
 
-import android.util.Log;
-
+import com.github.telarand.ws_android.utils.Logger;
 import com.github.telarand.ws_android.balancer.Balancer;
 import com.github.telarand.ws_android.bridge.Bridge;
 import com.github.telarand.ws_android.bridge.CryptoCtx;
@@ -15,7 +14,6 @@ import com.github.telarand.ws_android.pool.Pools;
 import com.github.telarand.ws_android.stats.Stats;
 import com.github.telarand.ws_android.utils.MTProtoUtils;
 
-
 import java.io.*;
 import java.net.*;
 import java.nio.ByteBuffer;
@@ -24,15 +22,13 @@ import java.security.SecureRandom;
 import java.util.*;
 import java.util.concurrent.*;
 
-/**
- * Главный сервер Telegram MTProto WebSocket прокси.
- */
 public final class TgWsProxyServer {
 
     private static final String TAG = "TgWsProxy";
 
     private static final double DC_FAIL_COOLDOWN = 30.0;
     private static final double WS_FAIL_TIMEOUT = 2.0;
+    private static final long BAD_HANDSHAKE_DRAIN_LIMIT = 64 * 1024;
 
     private static final Set<String> wsBlacklist = ConcurrentHashMap.newKeySet();
     private static final Map<String, Double> dcFailUntil = new ConcurrentHashMap<>();
@@ -49,10 +45,6 @@ public final class TgWsProxyServer {
     private volatile boolean running = false;
     private Thread serverThread;
 
-    /**
-     * Запускает сервер на основе текущего ProxyConfig.
-     * @throws IOException при ошибке запуска
-     */
     public void start() throws IOException {
         if (running) return;
         ProxyConfig config = ConfigManager.getProxyConfig();
@@ -61,19 +53,17 @@ public final class TgWsProxyServer {
         serverSocket.bind(new InetSocketAddress(config.getHost(), config.getPort()));
         running = true;
 
+        Bridge.resetTcpBackoff();
         initPoolsAndDomains();
 
         serverThread = new Thread(this::runServerLoop, "tg-proxy-main");
         serverThread.setDaemon(true);
         serverThread.start();
 
-        Log.i(TAG, "Server started on " + config.getHost() + ":" + config.getPort());
+        Logger.i(TAG, "Server started on " + config.getHost() + ":" + config.getPort());
         printStartupInfo();
     }
 
-    /**
-     * Останавливает сервер.
-     */
     public void stop() {
         running = false;
         try {
@@ -87,7 +77,7 @@ public final class TgWsProxyServer {
         Pools.CF_WORKER_POOL.reset();
         wsBlacklist.clear();
         dcFailUntil.clear();
-        Log.i(TAG, "Server stopped");
+        Logger.i(TAG, "Server stopped");
     }
 
     private void initPoolsAndDomains() {
@@ -113,10 +103,10 @@ public final class TgWsProxyServer {
                 clientSocket.setTcpNoDelay(true);
                 executor.submit(() -> handleClient(clientSocket));
             } catch (SocketException e) {
-                if (running) Log.w(TAG, "SocketException: " + e.getMessage());
+                if (running) Logger.w(TAG, "SocketException: " + e.getMessage());
                 break;
             } catch (IOException e) {
-                Log.e(TAG, "Accept error: " + e.getMessage(), e);
+                Logger.e(TAG, "Accept error: " + e.getMessage(), e);
             }
         }
     }
@@ -130,6 +120,7 @@ public final class TgWsProxyServer {
 
         try {
             clientSocket.setSoTimeout(10000);
+            clientSocket.setKeepAlive(true);
 
             ClientInitResult initResult = readClientInit(clientSocket, config.getSecretBytes(), label);
             if (initResult == null) {
@@ -143,9 +134,15 @@ public final class TgWsProxyServer {
             HandshakeInfo handshakeInfo = tryHandshake(handshake, config.getSecretBytes());
             if (handshakeInfo == null) {
                 Stats.INSTANCE.incConnectionsBad();
-                Log.w(TAG, "[" + effectiveLabel + "] bad handshake (wrong secret or proto)");
+                Logger.w(TAG, "[" + effectiveLabel + "] bad handshake (wrong secret or proto)");
                 try {
-                    while (effectiveIn.read(new byte[4096]) > 0) {}
+                    long drained = 0;
+                    byte[] drainBuf = new byte[4096];
+                    while (drained < BAD_HANDSHAKE_DRAIN_LIMIT) {
+                        int n = effectiveIn.read(drainBuf, 0, (int) Math.min(4096, BAD_HANDSHAKE_DRAIN_LIMIT - drained));
+                        if (n <= 0) break;
+                        drained += n;
+                    }
                 } catch (Exception ignored) {}
                 return;
             }
@@ -154,6 +151,13 @@ public final class TgWsProxyServer {
             boolean isMedia = handshakeInfo.isMedia;
             byte[] protoTag = handshakeInfo.protoTag;
             byte[] clientDecPrekeyIv = handshakeInfo.clientDecPrekeyIv;
+
+            boolean isTestDc = config.isForceTestDc() || dc >= 10000;
+            if (dc >= 10000) {
+                Logger.i(TAG, String.format("[%s] test DC%d -> DC%d",
+                        effectiveLabel, dc, dc - 10000));
+                dc -= 10000;
+            }
 
             int protoInt;
             if (Arrays.equals(protoTag, MTProtoUtils.PROTO_TAG_ABRIDGED)) {
@@ -168,24 +172,42 @@ public final class TgWsProxyServer {
             String mediaTag = isMedia ? " media" : "";
             String dcKey = dc + (isMedia ? "m" : "");
 
-            Log.d(TAG, String.format("[%s] handshake ok: DC%d%s proto=0x%08X",
+            Logger.d(TAG, String.format("[%s] handshake ok: DC%d%s proto=0x%08X",
                     effectiveLabel, dc, mediaTag, protoInt));
 
             byte[] relayInit = generateRelayInit(protoTag, dcIdx);
             CryptoCtx ctx = buildCryptoCtx(clientDecPrekeyIv, config.getSecretBytes(), relayInit);
 
+            // Фаза handshake завершена - восстанавливаем длинный таймаут
+            clientSocket.setSoTimeout(60000);
+
+            if (config.isForceCfProxy()) {
+                Logger.i(TAG, "[" + effectiveLabel + "] Принудительное использование CF-прокси для DC" + dc);
+                MsgSplitter splitterCf = null;
+                try {
+                    splitterCf = new MsgSplitter(relayInit, protoInt);
+                } catch (Exception ignored) {}
+                boolean ok = Bridge.doFallback(clientSocket, relayInit, effectiveLabel, dc, isTestDc, isMedia, ctx, splitterCf, protoTag);
+                if (ok) {
+                    Logger.i(TAG, "[" + effectiveLabel + "] CF-прокси успешно подключён");
+                    return;
+                } else {
+                    Logger.w(TAG, "[" + effectiveLabel + "] CF-прокси не удался, пробуем обычный WS");
+                }
+            }
+
             Map<Integer, String> dcRedirects = config.getDcRedirects();
             if (!dcRedirects.containsKey(dc) || wsBlacklist.contains(dcKey)) {
-                Log.i(TAG, String.format("[%s] DC%d%s %s -> fallback",
+                Logger.i(TAG, String.format("[%s] DC%d%s %s -> fallback",
                         effectiveLabel, dc, mediaTag,
                         dcRedirects.containsKey(dc) ? "WS blacklisted" : "not in config"));
                 MsgSplitter splitter = null;
                 try {
                     splitter = new MsgSplitter(relayInit, protoInt);
                 } catch (Exception ignored) {}
-                boolean ok = Bridge.doFallback(clientSocket, relayInit, effectiveLabel, dc, isMedia, ctx, splitter);
+                boolean ok = Bridge.doFallback(clientSocket, relayInit, effectiveLabel, dc, isTestDc, isMedia, ctx, splitter, protoTag);
                 if (!ok) {
-                    Log.w(TAG, String.format("[%s] DC%d%s no fallback available", effectiveLabel, dc, mediaTag));
+                    Logger.w(TAG, String.format("[%s] DC%d%s no fallback available", effectiveLabel, dc, mediaTag));
                 }
                 return;
             }
@@ -196,37 +218,38 @@ public final class TgWsProxyServer {
 
             List<String> domains = MTProtoUtils.wsDomains(dc, isMedia);
             String targetIp = dcRedirects.get(dc);
+            String wsPath = isTestDc ? MTProtoUtils.WS_PATH_TEST : MTProtoUtils.WS_PATH;
             RawWebSocket ws = null;
             boolean wsFailedRedirect = false;
             boolean allRedirects = true;
 
-            ws = Pools.WS_POOL.get(dc, isMedia, targetIp, domains);
+            ws = Pools.WS_POOL.get(dc, isMedia, targetIp, domains, isTestDc);
             if (ws != null) {
-                Log.i(TAG, String.format("[%s] DC%d%s -> pool hit via %s", effectiveLabel, dc, mediaTag, targetIp));
+                Logger.i(TAG, String.format("[%s] DC%d%s -> pool hit via %s", effectiveLabel, dc, mediaTag, targetIp));
             } else {
                 for (String domain : domains) {
-                    Log.i(TAG, String.format("[%s] DC%d%s -> wss://%s/apiws via %s",
+                    Logger.i(TAG, String.format("[%s] DC%d%s -> wss://%s/apiws via %s",
                             effectiveLabel, dc, mediaTag, domain, targetIp));
                     try {
-                        ws = RawWebSocket.connect(targetIp, domain, (float) wsTimeout, "/apiws");
+                        ws = RawWebSocket.connect(targetIp, domain, (float) wsTimeout, wsPath);
                         allRedirects = false;
                         break;
                     } catch (RawWebSocket.WsHandshakeException e) {
                         Stats.INSTANCE.incWsErrors();
                         if (e.isRedirect()) {
                             wsFailedRedirect = true;
-                            Log.w(TAG, String.format("[%s] DC%d%s got %d from %s -> %s",
+                            Logger.w(TAG, String.format("[%s] DC%d%s got %d from %s -> %s",
                                     effectiveLabel, dc, mediaTag, e.getStatusCode(), domain, e.getLocation()));
                             continue;
                         } else {
                             allRedirects = false;
-                            Log.w(TAG, String.format("[%s] DC%d%s WS handshake: %s",
+                            Logger.w(TAG, String.format("[%s] DC%d%s WS handshake: %s",
                                     effectiveLabel, dc, mediaTag, e.getStatusLine()));
                         }
                     } catch (Exception e) {
                         Stats.INSTANCE.incWsErrors();
                         allRedirects = false;
-                        Log.w(TAG, String.format("[%s] DC%d%s WS connect failed: %s",
+                        Logger.w(TAG, String.format("[%s] DC%d%s WS connect failed: %s",
                                 effectiveLabel, dc, mediaTag, e.getMessage()));
                     }
                 }
@@ -235,13 +258,13 @@ public final class TgWsProxyServer {
             if (ws == null) {
                 if (wsFailedRedirect && allRedirects) {
                     wsBlacklist.add(dcKey);
-                    Log.w(TAG, String.format("[%s] DC%d%s blacklisted for WS (all 302)",
+                    Logger.w(TAG, String.format("[%s] DC%d%s blacklisted for WS (all 302)",
                             effectiveLabel, dc, mediaTag));
                 } else if (wsFailedRedirect) {
                     dcFailUntil.put(dcKey, now + DC_FAIL_COOLDOWN);
                 } else {
                     dcFailUntil.put(dcKey, now + DC_FAIL_COOLDOWN);
-                    Log.i(TAG, String.format("[%s] DC%d%s WS cooldown for %ds",
+                    Logger.i(TAG, String.format("[%s] DC%d%s WS cooldown for %ds",
                             effectiveLabel, dc, mediaTag, (int) DC_FAIL_COOLDOWN));
                 }
 
@@ -249,9 +272,9 @@ public final class TgWsProxyServer {
                 try {
                     splitterFb = new MsgSplitter(relayInit, protoInt);
                 } catch (Exception ignored) {}
-                boolean ok = Bridge.doFallback(clientSocket, relayInit, effectiveLabel, dc, isMedia, ctx, splitterFb);
+                boolean ok = Bridge.doFallback(clientSocket, relayInit, effectiveLabel, dc, isTestDc, isMedia, ctx, splitterFb, protoTag);
                 if (ok) {
-                    Log.i(TAG, String.format("[%s] DC%d%s fallback closed", effectiveLabel, dc, mediaTag));
+                    Logger.i(TAG, String.format("[%s] DC%d%s fallback closed", effectiveLabel, dc, mediaTag));
                 }
                 return;
             }
@@ -262,7 +285,7 @@ public final class TgWsProxyServer {
             MsgSplitter splitter = null;
             try {
                 splitter = new MsgSplitter(relayInit, protoInt);
-                Log.d(TAG, String.format("[%s] MsgSplitter activated for proto 0x%08X", effectiveLabel, protoInt));
+                Logger.d(TAG, String.format("[%s] MsgSplitter activated for proto 0x%08X", effectiveLabel, protoInt));
             } catch (Exception ignored) {}
 
             ws.send(relayInit);
@@ -270,13 +293,13 @@ public final class TgWsProxyServer {
             Bridge.bridgeWsReencrypt(clientSocket, ws, effectiveLabel, ctx, dc, isMedia, splitter);
 
         } catch (SocketTimeoutException e) {
-            Log.w(TAG, "[" + label + "] timeout during handshake");
+            Logger.w(TAG, "[" + label + "] timeout during handshake");
         } catch (EOFException e) {
-            Log.d(TAG, "[" + label + "] client disconnected");
+            Logger.d(TAG, "[" + label + "] client disconnected");
         } catch (IOException e) {
-            Log.e(TAG, "[" + label + "] IO error: " + e.getMessage());
+            Logger.e(TAG, "[" + label + "] IO error: " + e.getMessage());
         } catch (Exception e) {
-            Log.e(TAG, "[" + label + "] unexpected: " + e.getMessage(), e);
+            Logger.e(TAG, "[" + label + "] unexpected: " + e.getMessage(), e);
         } finally {
             Stats.INSTANCE.decConnectionsActive();
             try { clientSocket.close(); } catch (Exception ignored) {}
@@ -307,9 +330,6 @@ public final class TgWsProxyServer {
         }
     }
 
-    /**
-     * Читает начальные данные клиента, обрабатывает PROXY protocol и Fake TLS.
-     */
     private ClientInitResult readClientInit(Socket clientSocket, byte[] secret, String label) throws IOException {
         ProxyConfig config = ConfigManager.getProxyConfig();
         InputStream in = clientSocket.getInputStream();
@@ -324,12 +344,12 @@ public final class TgWsProxyServer {
                     if (parts.length >= 6) {
                         label = parts[2] + ":" + parts[4];
                     }
-                    Log.d(TAG, "[" + label + "] PROXY protocol: " + line);
+                    Logger.d(TAG, "[" + label + "] PROXY protocol: " + line);
                 } else {
-                    Log.d(TAG, "[" + label + "] expected PROXY header, got: " + (line != null ? line.substring(0, Math.min(60, line.length())) : "null"));
+                    Logger.d(TAG, "[" + label + "] expected PROXY header, got: " + (line != null ? line.substring(0, Math.min(60, line.length())) : "null"));
                 }
             } catch (Exception e) {
-                Log.w(TAG, "[" + label + "] PROXY parse error: " + e.getMessage());
+                Logger.w(TAG, "[" + label + "] PROXY parse error: " + e.getMessage());
             }
         }
 
@@ -337,11 +357,11 @@ public final class TgWsProxyServer {
         try {
             int n = readWithTimeout(in, firstByte, 0, 1, 10000);
             if (n < 0) {
-                Log.d(TAG, "[" + label + "] client disconnected before handshake");
+                Logger.d(TAG, "[" + label + "] client disconnected before handshake");
                 return null;
             }
         } catch (SocketTimeoutException e) {
-            Log.w(TAG, "[" + label + "] timeout reading first byte");
+            Logger.w(TAG, "[" + label + "] timeout reading first byte");
             return null;
         }
 
@@ -352,11 +372,11 @@ public final class TgWsProxyServer {
             try {
                 int n = readWithTimeout(in, headerRest, 0, 4, 10000);
                 if (n < 4) {
-                    Log.d(TAG, "[" + label + "] incomplete TLS record header");
+                    Logger.d(TAG, "[" + label + "] incomplete TLS record header");
                     return null;
                 }
             } catch (SocketTimeoutException e) {
-                Log.w(TAG, "[" + label + "] timeout reading TLS header");
+                Logger.w(TAG, "[" + label + "] timeout reading TLS header");
                 return null;
             }
 
@@ -369,11 +389,11 @@ public final class TgWsProxyServer {
             try {
                 int n = readWithTimeout(in, recordBody, 0, recordLen, 10000);
                 if (n < recordLen) {
-                    Log.d(TAG, "[" + label + "] incomplete TLS record body");
+                    Logger.d(TAG, "[" + label + "] incomplete TLS record body");
                     return null;
                 }
             } catch (SocketTimeoutException e) {
-                Log.w(TAG, "[" + label + "] timeout reading TLS body");
+                Logger.w(TAG, "[" + label + "] timeout reading TLS body");
                 return null;
             }
 
@@ -382,15 +402,20 @@ public final class TgWsProxyServer {
             System.arraycopy(recordBody, 0, clientHello, 5, recordLen);
 
             FakeTls.TlsHelloInfo tlsInfo = FakeTls.verifyClientHello(clientHello, secret);
-            if (tlsInfo == null) {
-                Log.d(TAG, "[" + label + "] Fake TLS verify failed -> masking to " + fakeTlsDomain);
+            // Повтор hello - признак активного зондирования: отвечаем маскировкой
+            boolean replayed = (tlsInfo != null && !FakeTls.replayFirstSeen(tlsInfo.clientRandom));
+            if (tlsInfo == null || replayed) {
+                Logger.d(TAG, "[" + label + "] Fake TLS " + (replayed ? "hello replayed" : "verify failed")
+                        + " -> masking to " + fakeTlsDomain);
                 proxyToMaskingDomain(clientSocket, clientHello, fakeTlsDomain, label);
                 return null;
             }
 
-            Log.d(TAG, "[" + label + "] Fake TLS handshake ok (ts=" + tlsInfo.timestamp + ")");
+            Logger.d(TAG, "[" + label + "] Fake TLS handshake ok (ts=" + tlsInfo.timestamp + ")");
 
-            byte[] serverHello = FakeTls.buildServerHello(secret, tlsInfo.clientRandom, tlsInfo.sessionId);
+            byte[] serverHello = FakeTls.buildServerHello(secret, tlsInfo.clientRandom, tlsInfo.sessionId,
+                    FakeTls.parseClientHello(clientHello));
+            FakeTls.applyServerHelloDelay();
             out.write(serverHello);
             out.flush();
 
@@ -399,14 +424,14 @@ public final class TgWsProxyServer {
             try {
                 handshake = tlsStream.readexactly(MTProtoUtils.HANDSHAKE_LEN);
             } catch (EOFException e) {
-                Log.d(TAG, "[" + label + "] incomplete obfs2 init inside TLS");
+                Logger.d(TAG, "[" + label + "] incomplete obfs2 init inside TLS");
                 return null;
             }
 
             return new ClientInitResult(handshake, tlsStream, label);
         } else {
             if (fakeTlsDomain != null && !fakeTlsDomain.isEmpty()) {
-                Log.d(TAG, "[" + label + "] non-TLS byte 0x" + String.format("%02X", firstByte[0]) + " -> HTTP redirect");
+                Logger.d(TAG, "[" + label + "] non-TLS byte 0x" + String.format("%02X", firstByte[0]) + " -> HTTP redirect");
                 String redirect = "HTTP/1.1 301 Moved Permanently\r\n" +
                         "Location: https://" + fakeTlsDomain + "/\r\n" +
                         "Content-Length: 0\r\n" +
@@ -420,11 +445,11 @@ public final class TgWsProxyServer {
             try {
                 int n = readWithTimeout(in, rest, 0, rest.length, 10000);
                 if (n < rest.length) {
-                    Log.d(TAG, "[" + label + "] client disconnected before handshake");
+                    Logger.d(TAG, "[" + label + "] client disconnected before handshake");
                     return null;
                 }
             } catch (SocketTimeoutException e) {
-                Log.w(TAG, "[" + label + "] timeout reading handshake");
+                Logger.w(TAG, "[" + label + "] timeout reading handshake");
                 return null;
             }
 
@@ -435,28 +460,18 @@ public final class TgWsProxyServer {
         }
     }
 
-    /**
-     * Вспомогательный метод для чтения с таймаутом (использует setSoTimeout).
-     */
     private int readWithTimeout(InputStream in, byte[] buffer, int offset, int len, int timeoutMs) throws IOException {
         return in.read(buffer, offset, len);
     }
 
-    /**
-     * Проксирует соединение на маскирующий домен.
-     */
     private void proxyToMaskingDomain(Socket clientSocket, byte[] initialData, String domain, String label) {
         try {
             FakeTls.proxyToMaskingDomain(clientSocket, initialData, domain, label);
         } catch (Exception e) {
-            Log.w(TAG, "[" + label + "] masking error: " + e.getMessage());
+            Logger.w(TAG, "[" + label + "] masking error: " + e.getMessage());
         }
     }
 
-
-    /**
-     * Пытается расшифровать handshake и вернуть информацию.
-     */
     private HandshakeInfo tryHandshake(byte[] handshake, byte[] secret) {
         if (handshake.length < MTProtoUtils.HANDSHAKE_LEN) return null;
 
@@ -496,9 +511,6 @@ public final class TgWsProxyServer {
         return new HandshakeInfo(dc, isMedia, protoTag, decPrekeyAndIv);
     }
 
-    /**
-     * Генерирует relay_init.
-     */
     private byte[] generateRelayInit(byte[] protoTag, int dcIdx) {
         byte[] rnd = new byte[MTProtoUtils.HANDSHAKE_LEN];
         while (true) {
@@ -543,9 +555,6 @@ public final class TgWsProxyServer {
         return result;
     }
 
-    /**
-     * Строит CryptoCtx.
-     */
     private CryptoCtx buildCryptoCtx(byte[] clientDecPrekeyIv, byte[] secret, byte[] relayInit) {
         byte[] cltDecPrekey = Arrays.copyOfRange(clientDecPrekeyIv, 0, MTProtoUtils.PREKEY_LEN);
         byte[] cltDecIv = Arrays.copyOfRange(clientDecPrekeyIv, MTProtoUtils.PREKEY_LEN,
@@ -633,40 +642,46 @@ public final class TgWsProxyServer {
 
     private void printStartupInfo() {
         ProxyConfig config = ConfigManager.getProxyConfig();
-        Log.i(TAG, "============================================================");
-        Log.i(TAG, "  Telegram MTProto WS Bridge Proxy");
-        Log.i(TAG, "  Listening on   " + config.getHost() + ":" + config.getPort());
-        Log.i(TAG, "  Secret:        " + config.getSecret());
+        Logger.i(TAG, "============================================================");
+        Logger.i(TAG, "  Telegram MTProto WS Bridge Proxy");
+        Logger.i(TAG, "  Listening on   " + config.getHost() + ":" + config.getPort());
+        Logger.i(TAG, "  Secret:        " + config.getSecret());
         if (config.getFakeTlsDomain() != null && !config.getFakeTlsDomain().isEmpty()) {
-            Log.i(TAG, "  Fake TLS:      " + config.getFakeTlsDomain());
+            Logger.i(TAG, "  Fake TLS:      " + config.getFakeTlsDomain());
         }
-        Log.i(TAG, "  Target DC IPs:");
+        Logger.i(TAG, "  Target DC IPs:");
         for (Map.Entry<Integer, String> entry : config.getDcRedirects().entrySet()) {
-            Log.i(TAG, "    DC" + entry.getKey() + ": " + entry.getValue());
+            Logger.i(TAG, "    DC" + entry.getKey() + ": " + entry.getValue());
         }
         if (config.isFallbackCfproxy()) {
             String userDomain = config.getCfproxyUserDomains().isEmpty() ? "auto" : "user";
-            Log.i(TAG, "  CF proxy:      enabled (" + userDomain + ")");
+            Logger.i(TAG, "  CF proxy:      enabled (" + userDomain + ")");
         }
         if (!config.getCfproxyWorkerDomains().isEmpty()) {
-            Log.i(TAG, "  CF worker:     enabled (" + String.join(", ", config.getCfproxyWorkerDomains()) + ")");
+            Logger.i(TAG, "  CF worker:     enabled (" + String.join(", ", config.getCfproxyWorkerDomains()) + ")");
         }
-        Log.i(TAG, "============================================================");
+        if (config.isH2Enabled()) {
+            Logger.i(TAG, "  CF H2 media:   enabled");
+        }
+        if (config.isDisableSecure()) {
+            Logger.i(TAG, "  No secure:     enabled (port 80 for CF proxy/worker)");
+        }
+        Logger.i(TAG, "============================================================");
         String linkHost = MTProtoUtils.getLinkHost(config.getHost());
         String ddLink = "tg://proxy?server=" + linkHost +
                 "&port=" + config.getPort() +
                 "&secret=dd" + config.getSecret();
-        Log.i(TAG, "  Connect:");
+        Logger.i(TAG, "  Connect:");
         if (config.getFakeTlsDomain() != null && !config.getFakeTlsDomain().isEmpty()) {
             String domainHex = bytesToHex(config.getFakeTlsDomain().getBytes());
             String eeLink = "tg://proxy?server=" + linkHost +
                     "&port=" + config.getPort() +
                     "&secret=ee" + config.getSecret() + domainHex;
-            Log.i(TAG, "    " + eeLink);
+            Logger.i(TAG, "    " + eeLink);
         } else {
-            Log.i(TAG, "    " + ddLink);
+            Logger.i(TAG, "    " + ddLink);
         }
-        Log.i(TAG, "============================================================");
+        Logger.i(TAG, "============================================================");
     }
 
     private static String bytesToHex(byte[] bytes) {

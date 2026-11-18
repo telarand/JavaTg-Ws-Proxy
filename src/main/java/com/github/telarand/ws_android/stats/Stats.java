@@ -2,8 +2,6 @@ package com.github.telarand.ws_android.stats;
 
 import java.util.concurrent.atomic.AtomicLong;
 
-import com.github.telarand.ws_android.utils.MTProtoUtils;
-
 /**
  * Глобальная статистика соединений, трафика и пулов.
  */
@@ -12,8 +10,13 @@ public final class Stats {
     private final AtomicLong connectionsTotal = new AtomicLong(0);
     private final AtomicLong connectionsActive = new AtomicLong(0);
     private final AtomicLong connectionsWs = new AtomicLong(0);
+    private final AtomicLong connectionsH2 = new AtomicLong(0);
+    private final AtomicLong h2TcpConnections = new AtomicLong(0);
+    private final AtomicLong h2Requests = new AtomicLong(0);
+    private final AtomicLong h2Errors = new AtomicLong(0);
     private final AtomicLong connectionsTcpFallback = new AtomicLong(0);
     private final AtomicLong connectionsCfproxy = new AtomicLong(0);
+    private final AtomicLong connectionsFronting = new AtomicLong(0);
     private final AtomicLong connectionsBad = new AtomicLong(0);
     private final AtomicLong connectionsMasked = new AtomicLong(0);
     private final AtomicLong wsErrors = new AtomicLong(0);
@@ -46,12 +49,32 @@ public final class Stats {
         connectionsWs.incrementAndGet();
     }
 
+    public void incConnectionsH2() {
+        connectionsH2.incrementAndGet();
+    }
+
+    public void incH2TcpConnections() {
+        h2TcpConnections.incrementAndGet();
+    }
+
+    public void incH2Requests() {
+        h2Requests.incrementAndGet();
+    }
+
+    public void incH2Errors() {
+        h2Errors.incrementAndGet();
+    }
+
     public void incConnectionsTcpFallback() {
         connectionsTcpFallback.incrementAndGet();
     }
 
     public void incConnectionsCfproxy() {
         connectionsCfproxy.incrementAndGet();
+    }
+
+    public void incConnectionsFronting() {
+        connectionsFronting.incrementAndGet();
     }
 
     public void incConnectionsBad() {
@@ -90,59 +113,35 @@ public final class Stats {
         cfPoolMisses.incrementAndGet();
     }
 
-    /**
-     * Вызывать при открытии нового соединения (увеличивает total и active).
-     */
-    public void onConnectionOpened() {
-        connectionsTotal.incrementAndGet();
-        connectionsActive.incrementAndGet();
-    }
-
-    /**
-     * Вызывать при закрытии соединения (уменьшает active).
-     */
-    public void onConnectionClosed() {
-        connectionsActive.decrementAndGet();
-    }
-
-    /**
-     * Возвращает строку со всеми показателями.
-     */
+    /** Сводка в формате stats.summary() ядра. */
     public String summary() {
         long poolTotal = poolHits.get() + poolMisses.get();
-        String poolS = (poolTotal > 0) ? (poolHits.get() + "/" + poolTotal) : "n/a";
-
-        long cfPoolTotal = cfPoolHits.get() + cfPoolMisses.get();
-        String cfPoolS = (cfPoolTotal > 0) ? (cfPoolHits.get() + "/" + cfPoolTotal) : "n/a";
-
-        return "total=" + connectionsTotal.get() +
-                " active=" + connectionsActive.get() +
-                " ws=" + connectionsWs.get() +
-                " tcp_fb=" + connectionsTcpFallback.get() +
-                " cf=" + connectionsCfproxy.get() +
-                " bad=" + connectionsBad.get() +
-                " masked=" + connectionsMasked.get() +
-                " err=" + wsErrors.get() +
-                " pool=" + poolS +
-                " cf_pool=" + cfPoolS +
-                " up=" + MTProtoUtils.humanBytes(bytesUp.get()) +
-                " down=" + MTProtoUtils.humanBytes(bytesDown.get());
+        String poolS = poolTotal > 0 ? poolHits.get() + "/" + poolTotal : "n/a";
+        long cfTotal = cfPoolHits.get() + cfPoolMisses.get();
+        String cfPoolS = cfTotal > 0 ? cfPoolHits.get() + "/" + cfTotal : "n/a";
+        return "total=" + connectionsTotal.get()
+                + " active=" + connectionsActive.get()
+                + " ws=" + connectionsWs.get()
+                + " h2=" + connectionsH2.get()
+                + " h2_tcp=" + h2TcpConnections.get()
+                + " h2_req=" + h2Requests.get()
+                + " h2_err=" + h2Errors.get()
+                + " tcp_fb=" + connectionsTcpFallback.get()
+                + " cf=" + connectionsCfproxy.get()
+                + " front=" + connectionsFronting.get()
+                + " bad=" + connectionsBad.get()
+                + " masked=" + connectionsMasked.get()
+                + " err=" + wsErrors.get()
+                + " pool=" + poolS
+                + " cf_pool=" + cfPoolS
+                + " up=" + MTProtoUtilsHolder.humanBytes(bytesUp.get())
+                + " down=" + MTProtoUtilsHolder.humanBytes(bytesDown.get());
     }
 
-    public void reset() {
-        connectionsTotal.set(0);
-        connectionsActive.set(0);
-        connectionsWs.set(0);
-        connectionsTcpFallback.set(0);
-        connectionsCfproxy.set(0);
-        connectionsBad.set(0);
-        connectionsMasked.set(0);
-        wsErrors.set(0);
-        bytesUp.set(0);
-        bytesDown.set(0);
-        poolHits.set(0);
-        poolMisses.set(0);
-        cfPoolHits.set(0);
-        cfPoolMisses.set(0);
+    /** Отдельный держатель, чтобы не создавать цикл импортов в stat-пакете. */
+    private static final class MTProtoUtilsHolder {
+        static String humanBytes(long n) {
+            return com.github.telarand.ws_android.utils.MTProtoUtils.humanBytes(n);
+        }
     }
 }

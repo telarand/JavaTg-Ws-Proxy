@@ -58,17 +58,11 @@ public final class AesCtr {
 
         private Encryptor(Cipher cipher) { this.cipher = cipher; }
 
-        /**
-         * Шифрует/дешифрует очередной блок данных.
-         */
         public byte[] update(byte[] data) {
             if (data == null || data.length == 0) return new byte[0];
             return cipher.update(data);
         }
 
-        /**
-         * Перегрузка для работы с частью массива.
-         */
         public byte[] update(byte[] src, int offset, int len) {
             if (len == 0) return new byte[0];
             byte[] slice = new byte[len];
@@ -76,10 +70,6 @@ public final class AesCtr {
             return update(slice);
         }
 
-        /**
-         * Завершает шифрование (для CTR возвращает остаток).
-         * Переименовано с finalize, чтобы не конфликтовать с Object.finalize().
-         */
         public byte[] doFinal() {
             try {
                 return cipher.doFinal();

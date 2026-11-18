@@ -95,9 +95,6 @@ public final class MsgSplitter {
         return parts;
     }
 
-    /**
-     * Возвращает все оставшиеся данные как один пакет (flush).
-     */
     public List<byte[]> flush() {
         if (cipherBuf.length == 0) return new ArrayList<>();
         List<byte[]> result = new ArrayList<>();

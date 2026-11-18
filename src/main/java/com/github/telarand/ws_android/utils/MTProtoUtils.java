@@ -1,6 +1,5 @@
 package com.github.telarand.ws_android.utils;
 
-import java.io.IOException;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.SocketException;
@@ -9,8 +8,6 @@ import java.util.*;
 
 import okhttp3.Dns;
 import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.Response;
 
 /**
  * Утилитный класс.
@@ -49,16 +46,6 @@ public final class MTProtoUtils {
         RESERVED_FIRST_BYTES = Collections.unmodifiableSet(set);
     }
 
-    private static final List<byte[]> RESERVED_STARTS_LIST = new ArrayList<>();
-    static {
-        RESERVED_STARTS_LIST.add("HEAD".getBytes());
-        RESERVED_STARTS_LIST.add("POST".getBytes());
-        RESERVED_STARTS_LIST.add("GET ".getBytes());
-        RESERVED_STARTS_LIST.add(PROTO_TAG_INTERMEDIATE);
-        RESERVED_STARTS_LIST.add(PROTO_TAG_SECURE);
-        RESERVED_STARTS_LIST.add(new byte[] { 0x16, 0x03, 0x01, 0x02 });
-    }
-
     public static final byte[] RESERVED_CONTINUE = { 0, 0, 0, 0 };
 
     private static final Map<String, String> GITHUB_IPS;
@@ -80,6 +67,18 @@ public final class MTProtoUtils {
         map.put(203, "91.105.192.100");
         DC_DEFAULT_IPS = Collections.unmodifiableMap(map);
     }
+
+    public static final Map<Integer, String> DC_TEST_IPS;
+    static {
+        Map<Integer, String> map = new HashMap<>();
+        map.put(1, "149.154.175.10");
+        map.put(2, "149.154.167.40");
+        map.put(3, "149.154.175.117");
+        DC_TEST_IPS = Collections.unmodifiableMap(map);
+    }
+
+    public static final String WS_PATH = "/apiws";
+    public static final String WS_PATH_TEST = WS_PATH + "_test";
     
     public static final Set<byte[]> RESERVED_STARTS = Collections.unmodifiableSet(
         new HashSet<>(Arrays.asList(
@@ -91,26 +90,6 @@ public final class MTProtoUtils {
             new byte[]{0x16, 0x03, 0x01, 0x02}
         ))
     );
-
-    /**
-     * Проверяет, начинается ли переданный массив с одного из зарезервированных префиксов.
-     */
-    public static boolean isReservedStart(byte[] data) {
-        if (data == null || data.length == 0) return false;
-        for (byte[] prefix : RESERVED_STARTS_LIST) {
-            if (data.length >= prefix.length) {
-                boolean match = true;
-                for (int i = 0; i < prefix.length; i++) {
-                    if (data[i] != prefix[i]) {
-                        match = false;
-                        break;
-                    }
-                }
-                if (match) return true;
-            }
-        }
-        return false;
-    }
 
     /**
      * Возвращает список WebSocket-доменов для заданного DC.
@@ -188,23 +167,5 @@ public final class MTProtoUtils {
         return new OkHttpClient.Builder()
                 .dns(customDns)
                 .build();
-    }
-
-    /**
-     * Пример использования кастомного клиента для выполнения GET-запроса
-     * к GitHub (сырые файлы). Возвращает тело ответа в виде строки.
-     * @throws IOException при сетевых ошибках или если ответ не 2xx
-     */
-    public static String fetchGithubRaw(String url) throws IOException {
-        OkHttpClient client = buildGithubClient();
-        Request request = new Request.Builder()
-                .url(url)
-                .build();
-        try (Response response = client.newCall(request).execute()) {
-            if (!response.isSuccessful()) {
-                throw new IOException("HTTP error: " + response.code());
-            }
-            return response.body().string();
-        }
     }
 }
